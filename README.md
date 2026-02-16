@@ -93,6 +93,83 @@ make clean
 The client is only in GitHub now, you can use go get in order to use the manager.
 go install github.com/tomiok/queuety/manager@v0.0.4
 
+## Observability
+
+Queuety provides advanced observability capabilities using OpenTelemetry and Prometheus.
+
+### Metrics
+
+#### Message Metrics
+- `queuety_messages_published_total`: Total messages published by topic
+- `queuety_messages_delivered_total`: Total messages delivered by topic
+- `queuety_messages_failed_total`: Total failed messages by topic
+
+#### Performance Metrics
+- `queuety_message_processing_seconds`: Message processing latency histogram
+- `queuety_message_processing_average_seconds`: Average message processing time
+
+#### System Metrics
+- `queuety_topics_total`: Total number of active topics
+- `queuety_subscribers_total`: Number of subscribers per topic
+- `queuety_active_connections`: Number of active TCP connections
+
+#### Database Metrics
+- `queuety_badger_operations_total`: BadgerDB operation metrics
+
+#### Authentication Metrics
+- `queuety_auth_attempts_total`: Authentication attempts (success/failure)
+
+### Traces (Spans)
+
+Queuety instruments multiple operations with OpenTelemetry spans:
+
+#### Connection Spans
+- `handle_connections`: Client connection handling
+  - Attributes: `client.remote_addr`, `client.local_addr`
+
+#### Message Spans
+- `send_message`: Sending new messages
+  - Attributes: `topic.name`, `message.id`
+- `handle_json_message`: JSON message processing
+  - Attributes: `topic.name`, `operation`
+
+#### Database Spans
+- `badger_save_message`: Save message in BadgerDB
+  - Attributes: `message.id`, `topic.name`
+- `badger_update_message_ack`: Update message ACK
+  - Attributes: `message.id`, `topic.name`
+- `badger_check_not_delivered_messages`: Check undelivered messages
+  - Attributes: `messages.count`, `topics.checked`
+
+#### Authentication Spans
+- `do_login`: Login process
+  - Attributes: `user.attempt`, `client.remote_addr`
+
+#### Topic Management Spans
+- `add_subscriber`: Add new subscriber
+  - Attributes: `topic.name`
+- `add_topic`: Create new topic
+  - Attributes: `topic.name`
+
+### Configuration
+
+To enable OpenTelemetry, configure the following environment variables:
+
+- `QUEUETY_OTEL_ENABLED`: Enable OpenTelemetry (`true`/`false`)
+- `OTEL_EXPORTER_OTLP_GRPC_ENDPOINT`: OpenTelemetry gRPC endpoint
+- `OTEL_EXPORTER_OTLP_HTTP_ENDPOINT`: OpenTelemetry HTTP endpoint (alternative)
+
+To enable Prometheus, configure the following environment variables:
+
+- `QUEUETY_PROM_METRICS_ENABLED`: Expose Prometheus metrics (`true`/`false`)
+
+### Supported Exporters
+
+- Prometheus (endpoint `/metrics`)
+- OpenTelemetry (gRPC and HTTP)
+
+*Note: Metrics and tracing instrumentation is under continuous development.*
+
 ## Roadmap
 
 - [x] At-least-once delivery
@@ -103,7 +180,7 @@ go install github.com/tomiok/queuety/manager@v0.0.4
 - [x] Authentication (user/password)
 - [ ] Clustering
 - [ ] REST API
-- [ ] Metrics and monitoring
+- [x] Metrics and monitoring
 
 ## Contributing
 

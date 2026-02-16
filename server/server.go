@@ -1,16 +1,23 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/tomiok/queuety/server/observability"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Server struct {
@@ -30,6 +37,10 @@ type Server struct {
 
 	webServer    *http.Server
 	sentMessages map[Topic]*atomic.Int32
+
+	// Fields to track active connections
+	mu                sync.Mutex
+	activeConnections int
 }
 
 type Config struct {
@@ -144,6 +155,30 @@ func (s *Server) printStats() {
 }
 
 func (s *Server) handleConnections(conn net.Conn) {
+	ctx := context.Background()
+	defer observability.StartSpanWithAttributes(ctx, "handle_connections", trace.SpanKindServer,
+		observability.StringAttribute("client.remote_addr", conn.RemoteAddr().String()),
+		observability.StringAttribute("client.local_addr", conn.LocalAddr().String()),
+	)()
+
+	// Crear un contexto con el span para propagar a las funciones hijas
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.IsValid() {
+		ctx = trace.ContextWithSpanContext(ctx, spanCtx)
+	}
+
+	s.mu.Lock()
+	s.activeConnections++
+	observability.UpdateActiveConnectionsCount(s.activeConnections)
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.activeConnections--
+		observability.UpdateActiveConnectionsCount(s.activeConnections)
+		s.mu.Unlock()
+	}()
+
 	for {
 		buff := make([]byte, 2048)
 
@@ -160,54 +195,95 @@ func (s *Server) handleConnections(conn net.Conn) {
 
 		switch s.format {
 		case MessageFormatJSON:
-			s.handleJSON(conn, buff[:i])
+			s.handleJSON(ctx, conn, buff[:i])
 		}
 	}
 }
 
-func (s *Server) handleJSON(conn net.Conn, buff []byte) {
-	msg, err := DecodeMessage(buff)
-	if err != nil {
-		log.Printf("cannot parse message %v \n", err)
+func (s *Server) handleJSON(ctx context.Context, conn net.Conn, buff []byte) {
+	var err error
+	span, deferFn := observability.SpanWithAttributesAndError(ctx, "handle_json_message", trace.SpanKindServer)
+	defer deferFn(&err)
 
+	startTime := time.Now()
+	msg, decodeErr := DecodeMessage(buff)
+	if decodeErr != nil {
+		log.Printf("cannot parse message %v \n", decodeErr)
+		err = decodeErr
 		return
 	}
 
+	// Agregar atributos dinámicos
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("topic.name", msg.Topic().Name),
+	)
+
+	var operation string
 	switch msg.Type() {
 	case MessageTypeNewTopic:
+		operation = "new_topic"
 		s.addNewTopic(msg.Topic().Name)
 	case MessageTypeNew:
+		operation = "new_message"
 		s.sendNewMessage(msg)
 	case MessageTypeNewSubscriber:
+		operation = "new_subscriber"
 		s.addNewSubscriber(conn, msg.Topic())
 	case MessageTypeACK:
+		operation = "ack"
 		s.ack(msg)
 	case MessageTypeAuth:
+		operation = "auth"
 		s.doLogin(conn, msg)
+	default:
+		operation = "unknown"
 	}
+
+	// Agregar el atributo de operación
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("operation", operation),
+	)
+
+	processingTime := time.Since(startTime).Seconds()
+	observability.ObserveMessageProcessingTime(msg.Topic().Name, operation, processingTime)
 }
 
 func (s *Server) sendNewMessage(message Message) {
+	_, span := observability.StartSpan(context.Background(), "send_message", observability.WithSpanKind(trace.SpanKindProducer))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("topic.name", message.Topic().Name),
+		observability.StringAttribute("message.id", message.ID()),
+	)
+
 	clients := s.clients[message.Topic()]
 	if len(clients) == 0 {
 		log.Printf("topic not found, actual name: %s, values in memory: %v", message.Topic().Name, s.clients)
 		return
 	}
 
+	observability.IncrementPublishedMessages(message.Topic().Name)
+
 	// write for all the clients/connections
 	for _, conn := range clients {
 		b, err := message.Marshall()
 		if err != nil {
-			log.Printf("cannot marshall message: %v\n", err) // unclear error, don't want to re-intent.
+			observability.RecordSpanError(span, err)
 			return
 		}
 
 		_, err = conn.Write(b)
 		if err != nil {
 			log.Printf("cannot write in connection: %v message\n", err)
+			observability.RecordSpanError(span, err)
+
+			observability.IncrementFailedMessages(message.Topic().Name)
 			saveUnsentMessage(message, s.save)
 			return
 		}
+
+		observability.IncrementDeliveredMessages(message.Topic().Name)
 
 		fmt.Println("saving message")
 		s.save(message)
@@ -218,13 +294,23 @@ func (s *Server) sendNewMessage(message Message) {
 }
 
 func (s *Server) doLogin(conn net.Conn, message Message) {
+	_, span := observability.StartSpan(context.Background(), "do_login", observability.WithSpanKind(trace.SpanKindServer))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("user.attempt", message.User()),
+		observability.StringAttribute("client.remote_addr", conn.RemoteAddr().String()),
+	)
+
 	fmt.Println(s)
 	if !s.needAuth() {
 		message.updateAuthSuccess() // no auth need means successful.
 		b, err := message.Marshall()
 		if err != nil {
+			observability.RecordSpanError(span, err)
 			// just close the connection.
 			_ = conn.Close()
+			return
 		}
 		_, _ = conn.Write(b)
 		return
@@ -234,21 +320,15 @@ func (s *Server) doLogin(conn net.Conn, message Message) {
 		message.updateAuthFailed()
 		b, err := message.Marshall()
 		if err != nil {
+			observability.RecordSpanError(span, err)
 			// just close the connection.
 			_ = conn.Close()
+			return
 		}
 		_, _ = conn.Write(b)
-		return
 	}
 
-	message.updateAuthSuccess()
-	b, err := message.Marshall()
-	if err != nil {
-		// just close the connection.
-		_ = conn.Close()
-	}
-	_, _ = conn.Write(b)
-	return
+	observability.IncrementAuthAttempt("success")
 }
 
 func (s *Server) validateAuth(msg Message) bool {
@@ -269,48 +349,135 @@ func (s *Server) needAuth() bool {
 }
 
 func (s *Server) save(message Message) {
+	_, span := observability.StartSpan(context.Background(), "save_message", observability.WithSpanKind(trace.SpanKindInternal))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("message.id", message.ID()),
+		observability.StringAttribute("topic.name", message.Topic().Name),
+	)
+
 	if err := s.DB.saveMessage(message); err != nil {
 		log.Printf("cannot save message with id %s, %v\n", message.ID(), err)
+		observability.RecordSpanError(span, err)
 	}
 }
 
 func (s *Server) addNewSubscriber(conn net.Conn, topic Topic) {
+	_, span := observability.StartSpan(context.Background(), "add_subscriber", observability.WithSpanKind(trace.SpanKindInternal))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("topic.name", topic.Name),
+	)
+
 	s.clients[topic] = append(s.clients[topic], conn)
+
+	observability.UpdateSubscribersCount(topic.Name, len(s.clients[topic]))
 }
 
 func (s *Server) addNewTopic(name string) {
+	_, span := observability.StartSpan(context.Background(), "add_topic", observability.WithSpanKind(trace.SpanKindInternal))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("topic.name", name),
+	)
+
 	s.clients[NewTopic(name)] = []net.Conn{}
+
+	observability.UpdateActiveTopicsCount(len(s.clients))
 }
 
 func (s *Server) ack(message Message) {
+	_, span := observability.StartSpan(context.Background(), "message_ack", observability.WithSpanKind(trace.SpanKindInternal))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("message.id", message.ID()),
+		observability.StringAttribute("topic.name", message.Topic().Name),
+	)
+
 	if err := s.DB.updateMessageACK(message); err != nil {
-		log.Printf("cannot ACK message with id %s, %v", message.ID(), err)
+		log.Printf("cannot ACK message with id %s, %v\n", message.ID(), err)
+		observability.RecordSpanError(span, err)
 	}
 }
 
 func (s *Server) disconnect(conn net.Conn) {
+	_, span := observability.StartSpan(context.Background(), "disconnect", observability.WithSpanKind(trace.SpanKindServer))
+	defer observability.EndSpan(span, nil)
+
+	observability.AddSpanAttributes(span,
+		observability.StringAttribute("client.remote_addr", conn.RemoteAddr().String()),
+		observability.StringAttribute("client.local_addr", conn.LocalAddr().String()),
+	)
+
+	var disconnectedTopics []string
 	for topic, clients := range s.clients {
 		for i, client := range clients {
 			if client == conn {
 				s.clients[topic] = append(clients[:i], clients[i+1:]...)
-				log.Printf("client removed in topic: %s", topic.Name)
+				log.Printf("client removed in topic: %s\n", topic.Name)
+
+				disconnectedTopics = append(disconnectedTopics, topic.Name)
+				observability.AddSpanAttributes(span,
+					observability.StringAttribute("topic.name", topic.Name),
+				)
+
+				observability.UpdateSubscribersCount(topic.Name, len(s.clients[topic]))
 				break
 			}
 		}
 
 		if len(s.clients[topic]) == 0 {
 			delete(s.clients, topic)
-			log.Printf("%s is empty, deleting", topic.Name)
+			log.Printf("%s is empty, deleting\n", topic.Name)
 		}
+	}
+
+	if len(disconnectedTopics) > 0 {
+		observability.AddSpanAttributes(span,
+			observability.StringAttribute("disconnected_topics", strings.Join(disconnectedTopics, ",")),
+		)
 	}
 
 	err := conn.Close()
 	if err != nil {
-		log.Printf("cannot close deleted connection %v", err)
+		log.Printf("cannot close deleted connection %v\n", err)
 	}
+
+	observability.UpdateActiveTopicsCount(len(s.clients))
 }
 
 func saveUnsentMessage(msg Message, saveFn func(m Message)) {
 	msg.IncAttempts()
 	saveFn(msg)
+}
+
+func (s *Server) StartWebServer() error {
+	mux := http.NewServeMux()
+
+	metricsEnabled := os.Getenv("QUEUETY_PROM_METRICS_ENABLED")
+	if metricsEnabled == "" || metricsEnabled == "true" {
+		mux.Handle("/metrics", promhttp.Handler())
+	}
+
+	mux.HandleFunc("/stats", s.handleStats)
+
+	s.webServer.Handler = mux
+
+	log.Printf("Starting web server on %s", s.webServer.Addr)
+	return s.webServer.ListenAndServe()
+}
+
+func (s *Server) ShutdownWebServer() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := s.webServer.Shutdown(ctx); err != nil {
+		return err
+	}
+
+	return nil
 }
